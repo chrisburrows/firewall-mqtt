@@ -1,0 +1,15 @@
+[Unit]
+Description=Firewall MQTT Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+User=root
+EnvironmentFile=/usr/local/etc/firewall-mqtt.env
+ExecStart=/usr/local/bin/firewall-mqtt.py
+
+[Install]
+WantedBy=multi-user.target
