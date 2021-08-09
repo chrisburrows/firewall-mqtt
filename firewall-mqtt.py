@@ -20,7 +20,7 @@ LOG_FILENAME = '/var/log/firewall-mqtt.log'
 HA_ICON = "mdi:wall"
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "30"))
 
-MQTT_BROKER = os.getenv("MQTT_BROKER", "mqtt.local")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "mqtt.home")
 MQTT_USER = os.getenv("MQTT_USER", "mqtt")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "password")
 MQTT_BASE_TOPIC = "firewall"
@@ -30,68 +30,87 @@ ACCEPT = Rule(
     jump='ACCEPT'
 )
 
-NETFILTER_CHAINS = {
-    "lan": "LAN-TO-NET",
-    "iot": "IOT-TO-NET",
-    "not": "NOT-TO-NET",
-    "vpn": "VPN-TO-NET",
-    "voice": "ASSISTANTS-TO-NET",
-    "cloud": "CLOUD-TO-NET",
-    "guest": "GUEST-TO-NET" }
+# Acceptance Rule
+DROP = Rule(
+    jump='DROP'
+)
 
-def permit_internet_access(table, chain):
-    '''Permit access to the Internet by adding a rule to the chain'''
+NETFILTER_CHAINS = {
+    "lan": { "net-chain": "LAN-TO-NET",          "isolate": "ISOLATE-LAN",   "internet-enabled": True},
+    "iot": { "net-chain": "IOT-TO-NET",          "isolate": "ISOLATE-IOT",   "internet-enabled": True},
+    "not": { "net-chain": "NOT-TO-NET",          "isolate": "ISOLATE-NOT",   "internet-enabled": False},
+    "vpn": { "net-chain": "VPN-TO-NET",          "isolate": "ISOLATE-VPN",   "internet-enabled": True},
+    "voice": { "net-chain": "ASSISTANTS-TO-NET", "isolate": "ISOLATE-VOICE", "internet-enabled": True},
+    "cloud": { "net-chain": "CLOUD-TO-NET",      "isolate": "ISOLATE-CLOUD", "internet-enabled": True},
+    "guest": { "net-chain": "GUEST-TO-NET",      "isolate": "ISOLATE-GUEST", "internet-enabled": True},
+    }
+
+def permit_access(table, chain):
+    '''Permit access by adding a rule to the chain'''
 
     log.info("FW: Permitting access for " + chain)
     table.flush_chain(chain)
     table.append_rule(chain, ACCEPT)
 
-def block_internet_access(table, chain):
-    '''Deny access to the Internet by adding a rule to the chain'''
+def block_access(table, chain):
+    '''Deny access by adding a rule to the chain'''
 
     log.info("FW: Denying access for " + chain)
     table.flush_chain(chain)
+    table.append_rule(chain, DROP)
 
-def do_command(table, name, command):
+def do_command(table, chain, command):
     '''Set the state of a chain for a named group'''
     if command == 'on':
-        permit_internet_access(table, NETFILTER_CHAINS[name])
+        permit_access(table, chain)
     elif command == 'off':
-        block_internet_access(table, NETFILTER_CHAINS[name])
+        block_access(table, chain)
     else:
         log.info("Illegal command: " + command)
 
 
 def is_chain_accept_rule(table, chain):
-    '''Check if the chain is ACCEPT or empty (DENY)'''
+    '''Check if the chain is ACCEPT or empty (DROP)'''
     list = table.list_rules(chain)
     return len(list) == 1 and ACCEPT.specbits() == list[0].specbits()
 
 def publish_status(table, client):
     '''Publish the firewall status to MQTT'''
     log.info("MQTT: Publishing firewall states")
+    client.publish(MQTT_BASE_TOPIC + "/status", payload="online")
     for t in NETFILTER_CHAINS.keys():
         topic = "{base}/internet/{t}".format(base=MQTT_BASE_TOPIC, t=t)
-        enabled = is_chain_accept_rule(table, NETFILTER_CHAINS[t])
+        enabled = is_chain_accept_rule(table, NETFILTER_CHAINS[t]["net-chain"])
         client.publish(topic, payload="on" if enabled else "off")
+
+        topic = "{base}/isolation/{t}".format(base=MQTT_BASE_TOPIC, t=t)
+        enabled = is_chain_accept_rule(table, NETFILTER_CHAINS[t]["isolate"])
+        client.publish(topic, payload="off" if enabled else "on")
 
 def validate_chain(table, chain):
     '''Check to see if the chain is either empty or is just an ACCEPT'''
 
     list = table.list_rules(chain)
-    if len(list) == 0:
-      return True
-    if len(list) > 1:
+    if len(list) == 0 or len(list) > 1:
       return False
-    return ACCEPT.specbits() == list[0].specbits()
+    return ACCEPT.specbits() == list[0].specbits() or DROP.specbits() == list[0].specbits()
 
 def validate_all_chains(table):
     for chain in NETFILTER_CHAINS.values():
-      if not validate_chain(table, chain):
-          log.info("Checking chain " + chain + " - invalid rules found. Flushing and resetting to blocked")
-          block_internet_access(table, chain)
-      else:
-          log.info("Checking chain " + chain + " - Ok")
+        if not validate_chain(table, chain["net-chain"]):
+            log.info("Checking Internet access chain " + chain["net-chain"] + " - invalid rules found. Flushing and resetting to default")
+            if chain["internet-enabled"]:
+                permit_access(table, chain["net-chain"])
+            else:
+                block_access(table, chain["net-chain"])
+        else:
+            log.info("Checking Internet access chain " + chain["net-chain"] + " - invalid rules found. Flushing and resetting to default")
+
+        if not validate_chain(table, chain["isolate"]):
+            log.info("Checking isolation chain " + chain["isolate"] + " - invalid rules found. Flushing and resetting to enabled")
+            permit_access(table, chain["isolate"])
+        else:
+          log.info("Checking isolation chain " + chain["isolate"] + " - Ok")
 
 # The callback for when the client receives a CONNACK response from the server.
 def on_connect(client, userdata, flags, rc):
@@ -103,6 +122,7 @@ def on_connect(client, userdata, flags, rc):
 
     for t in NETFILTER_CHAINS.keys():
         client.subscribe(MQTT_BASE_TOPIC + "/internet/" + t + "/set")
+        client.subscribe(MQTT_BASE_TOPIC + "/isolation/" + t + "/set")
 
 # The callback for when a PUBLISH message is received from the server.
 def on_message(client, userdata, msg):
@@ -110,13 +130,33 @@ def on_message(client, userdata, msg):
     parts = msg.topic.split('/')
     if len(parts) == 4 and parts[1] == "internet" and parts[3] == "set":
         if parts[2] in NETFILTER_CHAINS:
-            do_command(userdata, parts[2], str(msg.payload, "UTF-8"))
+            do_command(userdata, NETFILTER_CHAINS[parts[2]]["net-chain"], str(msg.payload, "UTF-8"))
+            publish_status(table, client)
+    if len(parts) == 4 and parts[1] == "isolation" and parts[3] == "set":
+        if parts[2] in NETFILTER_CHAINS:
+            do_command(userdata, NETFILTER_CHAINS[parts[2]]["isolate"], "on" if str(msg.payload, "UTF-8") == "off" else "off")
             publish_status(table, client)
     
+    
 
-def publish_home_assistant_discovery(client, name):
+def publish_home_assistant_discovery(client, name, isolation=False):
     '''Publish discovery for a single firewall rule / switch'''
-    payload = {
+    if isolation:
+      payload = {
+        "name": "Firewall Net Isolation {name}".format(name=name.upper()),
+        "command_topic": "{base}/isolation/{name}/set".format(base=MQTT_BASE_TOPIC, name=name),
+        "state_topic": "{base}/isolation/{name}".format(base=MQTT_BASE_TOPIC, name=name),
+        "availability_topic": "{base}/status".format(base=MQTT_BASE_TOPIC),
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "payload_on": "on",
+        "payload_off": "off",
+        "unique_id": "{host}-{chain}-isolation".format(host=platform.node(), chain=name),
+        "icon": HA_ICON
+      }
+      discovery_topic = "homeassistant/switch/firewall-isolation-{name}/config".format(name=name)
+    else:
+      payload = {
         "name": "Firewall Net Access {name}".format(name=name.upper()),
         "command_topic": "{base}/internet/{name}/set".format(base=MQTT_BASE_TOPIC, name=name),
         "state_topic": "{base}/internet/{name}".format(base=MQTT_BASE_TOPIC, name=name),
@@ -127,8 +167,8 @@ def publish_home_assistant_discovery(client, name):
         "payload_off": "off",
         "unique_id": "{host}-{chain}".format(host=platform.node(), chain=name),
         "icon": HA_ICON
-    }
-    discovery_topic = "homeassistant/switch/firewall-net-access-{name}/config".format(name=name)
+      }
+      discovery_topic = "homeassistant/switch/firewall-net-access-{name}/config".format(name=name)
     client.publish(discovery_topic, json.dumps(payload))
 
 def home_assistant_discovery(client):
@@ -148,7 +188,8 @@ def home_assistant_discovery(client):
     client.publish(discovery_topic, json.dumps(payload))
 
     for name in NETFILTER_CHAINS.keys():
-        publish_home_assistant_discovery(client, name)
+        publish_home_assistant_discovery(client, name, isolation=False)
+        publish_home_assistant_discovery(client, name, isolation=True)
 
 def ping_test(client):
     '''Ping somegthing to check Internet access is up'''
@@ -190,13 +231,13 @@ try:
             client.user_data_set(table)
             client.loop_start()
 
-            log.info("MQTT: Publishing HA discovery data")
-            home_assistant_discovery(client)
-
             # mark us as online
             log.info("MQTT: Updating firewall states")
 
             while (True):
+                log.info("MQTT: Publishing HA discovery data")
+                home_assistant_discovery(client)
+
                 publish_status(table, client)
                 ping_test(client)
                 time.sleep(UPDATE_INTERVAL)
