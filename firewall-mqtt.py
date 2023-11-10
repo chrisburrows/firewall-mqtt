@@ -18,7 +18,7 @@ from netfilter.table import Table
 
 LOG_FILENAME = '/var/log/firewall-mqtt.log'
 HA_ICON = "mdi:wall"
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "30"))
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "60"))
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "mqtt.home")
 MQTT_USER = os.getenv("MQTT_USER", "mqtt")
@@ -78,15 +78,15 @@ def is_chain_drop_rule(table, chain):
 def publish_status(table, client):
     '''Publish the firewall status to MQTT'''
     log.info("MQTT: Publishing firewall states")
-    client.publish(MQTT_BASE_TOPIC + "/status", payload="online")
+    client.publish(MQTT_BASE_TOPIC + "/status", payload="online", retain=True)
     for t in NETFILTER_CHAINS.keys():
         topic = "{base}/internet/{t}".format(base=MQTT_BASE_TOPIC, t=t)
         denied = is_chain_drop_rule(table, NETFILTER_CHAINS[t]["net-chain"])
-        client.publish(topic, payload="off" if denied else "on")
+        client.publish(topic, payload="off" if denied else "on", retain=True)
 
         topic = "{base}/isolation/{t}".format(base=MQTT_BASE_TOPIC, t=t)
         enabled = is_chain_drop_rule(table, NETFILTER_CHAINS[t]["isolate"])
-        client.publish(topic, payload="on" if enabled else "off")
+        client.publish(topic, payload="on" if enabled else "off", retain=True)
 
 def validate_chain(table, chain, is_isolation=False):
     '''Check to see if the chain is either empty or is just an ACCEPT'''
@@ -122,7 +122,8 @@ def on_connect(client, userdata, flags, rc):
 
     # Subscribing in on_connect() means that if we lose the connection and
     # reconnect then subscriptions will be renewed.
-    client.publish(MQTT_BASE_TOPIC + "/status", payload="online")
+    client.publish(MQTT_BASE_TOPIC + "/status", payload="online", retain=True)
+    client.will_set(MQTT_BASE_TOPIC + "/status", payload="offline", retain=True)
 
     for t in NETFILTER_CHAINS.keys():
         client.subscribe(MQTT_BASE_TOPIC + "/internet/" + t + "/set")
@@ -178,33 +179,13 @@ def publish_home_assistant_discovery(client, name, isolation=False):
         "icon": HA_ICON
       }
       discovery_topic = "homeassistant/switch/firewall-net-access-{name}/config".format(name=name)
-    client.publish(discovery_topic, json.dumps(payload))
+    client.publish(discovery_topic, json.dumps(payload), retain=True)
 
 def home_assistant_discovery(client):
     '''Publish HA discovery'''
-    payload = {
-        "name": "Firewall Internet Access",
-        "state_topic": "{base}/internet".format(base=MQTT_BASE_TOPIC),
-        "availability_topic": "{base}/status".format(base=MQTT_BASE_TOPIC),
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "payload_on": "online",
-        "payload_off": "offline",
-        "unique_id": "{host}-internet-access".format(host=platform.node()),
-        "device_class": "connectivity"
-    }
-    discovery_topic = "homeassistant/binary_sensor/firewall-net-access/config"
-    client.publish(discovery_topic, json.dumps(payload))
-
     for name in NETFILTER_CHAINS.keys():
         publish_home_assistant_discovery(client, name, isolation=False)
         publish_home_assistant_discovery(client, name, isolation=True)
-
-def ping_test(client):
-    '''Ping somegthing to check Internet access is up'''
-    status = "online" if subprocess.run(["ping", "-c", "1", "8.8.8.8"], capture_output=True).returncode == 0 else "offline"
-    client.publish(MQTT_BASE_TOPIC + "/internet", status)
-    log.info("Testing Internet access: " + status)
 
 # setup logging
 log = logging.getLogger()
@@ -243,12 +224,11 @@ try:
             # mark us as online
             log.info("MQTT: Updating firewall states")
 
-            while (True):
-                log.info("MQTT: Publishing HA discovery data")
-                home_assistant_discovery(client)
+            log.info("MQTT: Publishing HA discovery data")
+            home_assistant_discovery(client)
 
+            while (True):
                 publish_status(table, client)
-                ping_test(client)
                 time.sleep(UPDATE_INTERVAL)
 
         except ConnectionRefusedError:
@@ -261,7 +241,7 @@ except KeyboardInterrupt:
 # mark us offline and disconnect
 log.info("MQTT: Publishing offline status")
 
-client.publish(MQTT_BASE_TOPIC + "/status", payload="offline")
+client.publish(MQTT_BASE_TOPIC + "/status", payload="offline", retain=True)
 time.sleep(3)
 
 log.info("MQTT: disconnecting")
