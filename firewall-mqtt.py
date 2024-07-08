@@ -143,14 +143,14 @@ def on_message(client, userdata, msg) -> None:
     payload=str(msg.payload, "UTF-8").strip()
     log.info("MQTT: Message " + msg.topic + " = " + payload)
     parts = msg.topic.split('/')
-    if len(parts) == 5 and parts[3] == "internet" and parts[4] == "set":
+    if len(parts) == 5 and parts[2] == "internet" and parts[4] == "set":
         if parts[3] in NETFILTER_CHAINS:
-            chain = NETFILTER_CHAINS[parts[2]]["net-chain"]
+            chain = NETFILTER_CHAINS[parts[3]]["net-chain"]
             state = payload
             rule = ACCEPT if state == "on" else DROP
-    if len(parts) == 5 and parts[3] == "isolation" and parts[4] == "set":
+    if len(parts) == 5 and parts[2] == "isolation" and parts[4] == "set":
         if parts[3] in NETFILTER_CHAINS:
-            chain = NETFILTER_CHAINS[parts[2]]["isolate"]
+            chain = NETFILTER_CHAINS[parts[3]]["isolate"]
             state = payload
             rule = RETURN if state == "off" else DROP
 
